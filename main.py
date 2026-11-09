@@ -272,6 +272,11 @@ def load_db() -> dict:
     data.setdefault("color_game", {})
     data.setdefault("bank_history", {})
     data.setdefault("mafia", {})
+    data.setdefault("loans", {})
+    data.setdefault("listings", {})
+    data.setdefault("listing_counter", 0)
+    data.setdefault("income_last", {})
+    data.setdefault("income_pending", {})
     data.setdefault("dm_broadcast_progress", None)
     return data
 
@@ -529,8 +534,25 @@ TICKET_TYPES = {
         "label": "مساعدة",
         "emoji": "🆘",
         "description": "طلب مساعدة عامة",
+        "hidden": True,          # قديم: يبقى للتذاكر المفتوحة سابقاً بس ما يظهر بالقائمة
+    },
+    "complaint_discord": {
+        "label": "شكوى داخل السيرفر",
+        "emoji": "🚨",
+        "description": "شكوى تخص السيرفر أو الأعضاء",
+    },
+    "complaint_map": {
+        "label": "شكوى داخل الماب",
+        "emoji": "🛠️",
+        "description": "شكوى تخص اللعب داخل الماب",
     },
 }
+TICKET_TYPES["complaint"]["hidden"] = True      # قديم (شكوى عامة) - يبقى للتذاكر القديمة بس
+
+
+def get_ticket_type(key: str) -> dict:
+    """يرجع بيانات نوع التذكرة، ولو المفتاح مجهول (لوحة قديمة) يرجع نوع افتراضي بدل ما ينهار."""
+    return TICKET_TYPES.get(key) or {"label": str(key), "emoji": "🎫", "description": ""}
 
 
 # =====================================================================
@@ -639,7 +661,7 @@ def build_ticket_embed(ticket_number: str, ticket_type_key: str, opener: discord
                         status: str = "غير مستلمة", claimed_by: str | None = None,
                         banner_url: str | None = None) -> discord.Embed:
     """بناء إمبيد معلومات التذكرة (يُستخدم عند الفتح وعند التحديث)."""
-    t = TICKET_TYPES[ticket_type_key]
+    t = get_ticket_type(ticket_type_key)
     embed = discord.Embed(
         title=f"{t['emoji']} تذكرة #{ticket_number} - {t['label']}",
         description=(
@@ -736,7 +758,7 @@ async def close_ticket(channel: discord.TextChannel, closer: discord.Member, tic
         )
         embed.add_field(name="👤 صاحب التذكرة", value=f"<@{ticket['opener_id']}>", inline=True)
         embed.add_field(name="🔒 أغلقها", value=closer.mention, inline=True)
-        embed.add_field(name="📌 النوع", value=TICKET_TYPES[ticket["type"]]["label"], inline=True)
+        embed.add_field(name="📌 النوع", value=get_ticket_type(ticket["type"])["label"], inline=True)
         try:
             await log_channel.send(embed=embed, file=discord.File(transcript_path))
         except Exception:
@@ -1078,7 +1100,7 @@ async def create_ticket(interaction: discord.Interaction, ticket_type_key: str, 
 
     log_channel = guild.get_channel(TICKET_LOG_CHANNEL_ID)
     if log_channel:
-        t = TICKET_TYPES[ticket_type_key]
+        t = get_ticket_type(ticket_type_key)
         await log_channel.send(
             f"📩 تذكرة جديدة `#{ticket_number}` ({t['label']}) بواسطة {user.mention} - {channel.mention}"
         )
@@ -1144,7 +1166,7 @@ class TicketTypeSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label=v["label"], value=k, emoji=v["emoji"], description=v["description"])
-            for k, v in TICKET_TYPES.items()
+            for k, v in TICKET_TYPES.items() if not v.get("hidden")
         ]
         super().__init__(
             placeholder="Make a Selection | اختر نوع التذكرة",
@@ -1534,6 +1556,7 @@ async def on_ready():
     bot.add_view(SuggestionPanelView())
     bot.add_view(ControlPanelView())
     bot.add_view(RatingView())
+    restore_trade_views()
 
     # تشغيل تحديث أسعار السوق العالمي (مرة وحدة فقط حتى لو تكرر on_ready)
     if not market_updater.is_running():
@@ -1903,6 +1926,14 @@ def _ar_shape_fallback(text: str) -> str:
             return "L"
         return "N"
     kinds = [kind(ch) for ch in flat]
+    # علامات مرتبطة بالأرقام ($ + - , . # %) تنضم للرقم المجاور بدل ما تنقلب
+    for _ in range(3):
+        for i2, ch in enumerate(flat):
+            if kinds[i2] == "N" and ch in "+-$,.#%":
+                nxt_l = i2 + 1 < len(flat) and kinds[i2 + 1] == "L" and flat[i2 + 1].isdigit() or (i2 + 1 < len(flat) and kinds[i2 + 1] == "L" and flat[i2 + 1] in "+-$#")
+                prv_l = i2 > 0 and kinds[i2 - 1] == "L" and flat[i2 - 1].isdigit()
+                if (ch in "+-$#" and nxt_l) or (ch in ",.%" and prv_l and (ch == "%" or (i2 + 1 < len(flat) and flat[i2 + 1].isdigit()))):
+                    kinds[i2] = "L"
     first = next((kd for kd in kinds if kd != "N"), "L")
     if first == "L":                       # اتجاه أساسي LTR: نعكس أي مقطع عربي داخلياً بس
         res, run = [], []
@@ -1936,7 +1967,8 @@ def _prep(text: str) -> str:
     if HAS_AR_LIBS:
         return _bidi_display(arabic_reshaper.reshape(text))
     if features.check("raqm"):
-        return text                      # Raqm يشكّل ويرتّب لحاله
+        # Raqm يشكّل ويرتّب لحاله - بس نعزل الأرقام/المبالغ ($1,200 / +$750 / x2.50) عشان ما تنقلب جوا النص العربي
+        return re.sub(r"[xX]?[+\-#]?\$?\d[\d,\.]*(?:Qa|[MBT]|%)?", lambda mo: "\u2066" + mo.group(0) + "\u2069", text)
     return _ar_shape_fallback(text)      # احتياطي مدمج: يضمن اتصال الحروف بدون أي مكتبة
 
 
@@ -3262,6 +3294,60 @@ def find_asset_key(words: list[str]):
     return None
 
 
+# =====================================================================
+#        🛡️  أوامر الإدارة بالبنك: اعطاء / ضبط (لاسترجاع الفلوس بعد تصفير البوت)
+#   اعطاء @شخص 50000   |  اعطاء @شخص1 @شخص2 50000  |  اعطاء الكل 10000
+#   ضبط @شخص 150000    (يخلي رصيده بالضبط هالرقم)
+#   للإدارة (Administrator) أو رتبة BANK_OWNER_ROLE_ID فقط
+# =====================================================================
+BANK_ADMIN_WORDS = {"اعطاء": "give", "إعطاء": "give", "اعطي": "give", "ضبط": "set"}
+
+
+def _is_bank_admin(member) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator or member.id == member.guild.owner_id:
+        return True
+    return bool(BANK_OWNER_ROLE_ID and any(r.id == BANK_OWNER_ROLE_ID for r in member.roles))
+
+
+async def handle_bank_admin(message: discord.Message, word: str, parts: list) -> bool:
+    mode = BANK_ADMIN_WORDS[word]
+    if not _is_bank_admin(message.author):
+        await message.reply("❌ هذا الأمر للإدارة فقط.", mention_author=False)
+        return True
+    rest = [p for p in parts if not re.fullmatch(r"<@[!&]?\d+>", p)]
+    to_all = any(p in ("الكل", "الجميع", "الكل.") for p in rest)
+    rest = [p for p in rest if p not in ("الكل", "الجميع")]
+    amount = parse_amount(" ".join(rest)) if rest else None
+    targets = [m for m in message.mentions if isinstance(m, discord.Member) and not m.bot]
+    if amount is None or amount < 0 or (mode == "give" and amount == 0):
+        await message.reply("❌ الاستخدام:\n`اعطاء @شخص 50000`\n`اعطاء @شخص1 @شخص2 50000`\n`اعطاء الكل 10000`\n`ضبط @شخص 150000` (يضبط رصيده بالضبط)", mention_author=False)
+        return True
+    if to_all:
+        if mode == "set":
+            await message.reply("❌ `ضبط` ما يشتغل على الكل، حدد الأشخاص بالمنشن.", mention_author=False)
+            return True
+        targets = [m for m in message.guild.members if not m.bot]
+    if not targets:
+        await message.reply("❌ حدد شخص بالمنشن أو اكتب `الكل`.", mention_author=False)
+        return True
+    db = load_db()
+    for m in targets:
+        uid = str(m.id)
+        cur = db["economy"].get(uid, STARTING_BALANCE)
+        db["economy"][uid] = amount if mode == "set" else cur + amount
+    save_db(db)
+    if mode == "set":
+        txt = f"✅ تم ضبط رصيد {' '.join(m.mention for m in targets)} إلى **{fmt_money(amount)}**"
+    elif to_all:
+        txt = f"✅ تم إعطاء **{len(targets)}** عضو مبلغ **{fmt_money(amount)}** لكل واحد"
+    else:
+        txt = f"✅ تم إعطاء {' '.join(m.mention for m in targets)} مبلغ **{fmt_money(amount)}**" + (" لكل واحد" if len(targets) > 1 else "")
+    await message.reply(txt, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+    return True
+
+
 async def handle_bank_text(message: discord.Message) -> bool:
     """يرجع True لو الرسالة كانت أمر بنك وتمت معالجتها."""
     if BANK_CHANNEL_ID and message.channel.id != BANK_CHANNEL_ID:
@@ -3269,6 +3355,18 @@ async def handle_bank_text(message: discord.Message) -> bool:
     if not isinstance(message.author, discord.Member):
         return False
     parts = message.content.strip().split()
+    if parts and parts[0] in (NEW_ECON_WORDS | BANK_ADMIN_WORDS | set(EXTRA_BANK_ACTIONS) | set(BANK_TEXT_TRIGGERS)):
+        try:
+            _ov = settle_overdue_loan(message.author.id)
+            if _ov:
+                await message.reply(_ov, mention_author=False)
+        except Exception as e:
+            print(f"⚠️ تحصيل القرض المتأخر: {e}")
+    if parts and parts[0] in NEW_ECON_WORDS:
+        if await handle_new_economy(message, parts):
+            return True
+    if parts and parts[0] in BANK_ADMIN_WORDS:
+        return await handle_bank_admin(message, parts[0], parts[1:])
     if parts and parts[0] in EXTRA_BANK_ACTIONS:
         rest0 = [p for p in parts[1:] if not re.fullmatch(r"<@!?\d+>", p)]
         return await handle_extra_bank(message, parts[0], rest0)
@@ -4547,6 +4645,9 @@ async def act_properties(user, **_):
     rows = [(info["name"], str(props.get(k, 0)), fmt_money(props.get(k, 0) * info["price"]), None) for k, info in PROPERTY_CATALOG.items()]
     rows.append(("أسهم", str(props.get("stocks", 0)), fmt_money(props.get("stocks", 0) * STOCK_PRICE), None))
     rows.append(("ذهب (Gold)", str(gold), "—", None))
+    _rate = income_rate(user.id, db)
+    if _rate:
+        rows.append(("دخل الممتلكات", "", f"{fmt_money(_rate)} / ساعة", None))
     rows.append(("الكاش", "", fmt_money(db["economy"].get(str(user.id), STARTING_BALANCE)), None, True))
     rows.append(("إجمالي الثروة", "", fmt_money(net_worth(user.id, db)), GREEN, True))
     buf = await _run_sync(_render_table_sync, f"ممتلكات {_trunc(_clean_name(user.display_name), 12)}",
@@ -4578,7 +4679,10 @@ BANK_HELP_LINES = [
     ("الغام [مبلغ]", "ألغام بمضاعف حقيقي (مجاني أو برهان)"), ("لعبه", "حجرة ورقة مقص"), ("فواكه", "ماكينة فواكه متحركة"),
     ("لون", "أي لون أكثر بالشبكة؟ (25 محاولة يومياً)"), ("تسريع / جولد 30", f"تسريع = Gold x{SPEEDUP_GOLD_COST} | جولد + عدد = اشتري كم تبغى"),
     ("شراء / بيع", "متجر الممتلكات (أو: شراء ذهب 500 للسوق)"), ("سوق / حصالتي", "أسعار السوق ومحفظتك"),
-    ("ممتلكات", "ممتلكاتك وثروتك"), ("اغنى", "أغنى 10 أعضاء"), ("فلوس / تحويل", "رصيدك وتحويل الفلوس"), ("وقت", "جاهزية كل الأوامر"),
+    ("ممتلكات", "ممتلكاتك وثروتك"), ("اغنى", "أغنى 10 أعضاء"), ("فلوس / تحويل", "رصيدك وتحويل الفلوس"), ("اعطاء / ضبط (إدارة)", "اعطاء @شخص 5000 • اعطاء الكل 1000"), ("وقت", "جاهزية كل الأوامر"),
+    ("بلاك جاك [مبلغ]", "اسحب / قف / ضاعف ضد الموزع"), ("كراش [مبلغ] [سحب تلقائي]", "اسحب قبل الانفجار: كراش 500 2.5"),
+    ("مليون", "من سيربح المليون: 10 أسئلة"), ("عرض / عروض / الغاء عرض", "بيع ذهب وممتلكات للاعبين: عرض ذهب 5 15000"),
+    ("دخل", "تحصيل دخل ممتلكاتك بالساعة"), ("قرض / سداد / قرضي", "قرض 5000 بفائدة 10٪ ومهلة 24 ساعة"),
 ]
 
 
@@ -6188,6 +6292,1261 @@ async def handle_mafia_text(message: discord.Message) -> bool:
 
 
 # =====================================================================
+#   🎰  رسومات الألعاب الجديدة: كراش / بلاك جاك / من سيربح المليون / عروض اللاعبين
+# =====================================================================
+_SUIT_RED = (204, 36, 46)
+_SUIT_BLK = (26, 26, 32)
+
+
+def _draw_suit(d, cx, cy, s, suit, color=None, A=255):
+    col = (color or (_SUIT_RED if suit in ("H", "D") else _SUIT_BLK)) + (A,)
+    if suit == "H":
+        for ox in (-.2, .2):
+            d.ellipse((cx + ox * s - .26 * s, cy - .14 * s - .26 * s, cx + ox * s + .26 * s, cy - .14 * s + .26 * s), fill=col)
+        d.polygon([(cx - .45 * s, cy - .04 * s), (cx + .45 * s, cy - .04 * s), (cx, cy + .48 * s)], fill=col)
+    elif suit == "D":
+        d.polygon([(cx, cy - .5 * s), (cx + .36 * s, cy), (cx, cy + .5 * s), (cx - .36 * s, cy)], fill=col)
+    elif suit == "S":
+        for ox in (-.2, .2):
+            d.ellipse((cx + ox * s - .26 * s, cy + .02 * s - .26 * s, cx + ox * s + .26 * s, cy + .02 * s + .26 * s), fill=col)
+        d.polygon([(cx - .45 * s, cy - .02 * s), (cx + .45 * s, cy - .02 * s), (cx, cy - .52 * s)], fill=col)
+        d.polygon([(cx, cy + .05 * s), (cx - .17 * s, cy + .5 * s), (cx + .17 * s, cy + .5 * s)], fill=col)
+    else:  # club
+        for ox, oy in ((0, -.22), (-.25, .06), (.25, .06)):
+            d.ellipse((cx + ox * s - .23 * s, cy + oy * s - .23 * s, cx + ox * s + .23 * s, cy + oy * s + .23 * s), fill=col)
+        d.polygon([(cx, cy + .02 * s), (cx - .17 * s, cy + .5 * s), (cx + .17 * s, cy + .5 * s)], fill=col)
+
+
+def _draw_card(d, x, y, w, h, rank=None, suit=None, hidden=False, k=2):
+    r = int(w * .12)
+    d.rounded_rectangle((x + 3 * k, y + 4 * k, x + w + 3 * k, y + h + 4 * k), radius=r, fill=(0, 0, 0, 90))
+    if hidden:
+        d.rounded_rectangle((x, y, x + w, y + h), radius=r, fill=(150, 36, 48, 255), outline=(255, 255, 255, 255), width=int(2.5 * k))
+        d.rounded_rectangle((x + w * .12, y + h * .09, x + w * .88, y + h * .91), radius=int(r * .7), outline=(236, 196, 92, 255), width=int(2 * k))
+        for i in range(5):
+            yy = y + h * (.2 + i * .15)
+            d.line([(x + w * .2, yy), (x + w * .8, yy + h * .06)], fill=(236, 196, 92, 120), width=int(1.4 * k))
+        return
+    d.rounded_rectangle((x, y, x + w, y + h), radius=r, fill=(252, 250, 244, 255), outline=(60, 60, 66, 255), width=int(1.6 * k))
+    col = (_SUIT_RED if suit in ("H", "D") else _SUIT_BLK)
+    _text(d, (x + w * .16, y + h * .15), rank, int(w * .30), col + (255,), "lm")
+    _draw_suit(d, x + w * .22, y + h * .33, w * .2, suit)
+    _draw_suit(d, x + w * .5, y + h * .62, w * .46, suit)
+
+
+def _bj_value(cards):
+    tot = sum(11 if r == "A" else 10 if r in ("J", "Q", "K") else int(r) for r, _ in cards)
+    aces = sum(1 for r, _ in cards if r == "A")
+    while tot > 21 and aces:
+        tot -= 10
+        aces -= 1
+    return tot
+
+
+def _render_blackjack_sync(avatar, name, bet, player, dealer, reveal, banner=None, tone=None) -> io.BytesIO:
+    """banner: نص النتيجة | tone: 'win'|'lose'|'push'"""
+    k, W, H = 2, 760, 520
+    img, d = _mf_canvas(W, H, "town", k)
+    try:
+        av = _circle_avatar(avatar, 54 * k)
+        d.ellipse((28 * k - 3 * k, 24 * k - 3 * k, 28 * k + 57 * k, 24 * k + 57 * k), fill=(224, 186, 90, 255))
+        img.alpha_composite(av, (28 * k, 24 * k))
+        d = ImageDraw.Draw(img)
+    except Exception:
+        pass
+    _text_fit(d, (96 * k, 44 * k), _trunc(name, 16), int(24 * k), (255, 255, 255, 255), "lm", 260 * k)
+    _text(d, (96 * k, 72 * k), "بلاك جاك", int(18 * k), (236, 205, 140, 255), "lm")
+    d.rounded_rectangle((W * k - 230 * k, 24 * k, W * k - 34 * k, 84 * k), radius=18 * k, fill=(20, 12, 8, 220), outline=(224, 186, 90, 255), width=int(2 * k))
+    _text(d, (W * k - 132 * k, 41 * k), "الرهان", int(14 * k), (210, 180, 130, 255), "mm")
+    _text_fit(d, (W * k - 132 * k, 67 * k), fmt_money(bet), int(26 * k), (255, 255, 255, 255), "mm", 170 * k)
+    cw, ch = 100 * k, 140 * k
+
+    def row(cards, y, hide_second):
+        n = len(cards)
+        gap = min(cw + 12 * k, (640 * k - cw) // max(n - 1, 1)) if n > 1 else 0
+        total = cw + gap * (n - 1)
+        x0 = (W * k - total) // 2
+        for i, (r_, s_) in enumerate(cards):
+            _draw_card(d, x0 + i * gap, y, cw, ch, r_, s_, hidden=(hide_second and i == 1), k=k)
+
+    _text(d, (W * k / 2, 112 * k), "الموزّع" + (f"  •  {_bj_value(dealer)}" if reveal else ""), int(20 * k), (255, 255, 255, 235), "mm")
+    row(dealer, 128 * k, not reveal)
+    pv = _bj_value(player)
+    _text(d, (W * k / 2, 292 * k), f"{name if False else 'أنت'}  •  {pv}", int(20 * k), (255, 255, 255, 235), "mm")
+    row(player, 308 * k, False)
+    if banner:
+        col = {"win": (110, 230, 140), "lose": (240, 110, 100), "push": (236, 205, 140)}[tone]
+        d.rounded_rectangle((120 * k, 462 * k, (W - 120) * k, 506 * k), radius=18 * k, fill=(14, 8, 5, 235), outline=col + (255,), width=int(2 * k))
+        _text_fit(d, (W * k / 2, 484 * k), banner, int(26 * k), col + (255,), "mm", 500 * k)
+    return _to_png(img, (W, H))
+
+
+# ------------------------------- كراش -------------------------------
+def _render_crash_sync(avatar, name, bet, mult, t_now, status, crash_mult=None, cash_mult=None, auto=None, rate=0.18) -> io.BytesIO:
+    k, W, H = 2, 760, 450
+    theme = {"running": "night", "cashed": "town", "crashed": "dead"}[status]
+    img, d = _mf_canvas(W, H, theme, k)
+    try:
+        av = _circle_avatar(avatar, 50 * k)
+        d.ellipse((28 * k - 3 * k, 24 * k - 3 * k, 28 * k + 53 * k, 24 * k + 53 * k), fill=(224, 186, 90, 255))
+        img.alpha_composite(av, (28 * k, 24 * k))
+        d = ImageDraw.Draw(img)
+    except Exception:
+        pass
+    _text_fit(d, (92 * k, 42 * k), _trunc(name, 16), int(23 * k), (255, 255, 255, 255), "lm", 260 * k)
+    _text(d, (92 * k, 68 * k), "كراش" + (f"  •  سحب تلقائي x{auto:.2f}" if auto else ""), int(17 * k), (236, 205, 140, 255), "lm")
+    gx0, gy0, gx1, gy1 = 50 * k, 110 * k, (W - 50) * k, 360 * k
+    d.rounded_rectangle((gx0, gy0, gx1, gy1), radius=20 * k, fill=(10, 8, 20, 170), outline=(224, 186, 90, 90), width=int(1.4 * k))
+    for i in range(1, 5):
+        yy = gy0 + (gy1 - gy0) * i / 5
+        d.line([(gx0 + 8 * k, yy), (gx1 - 8 * k, yy)], fill=(255, 255, 255, 22), width=int(1 * k))
+    T = max(t_now, 6.0)
+    top = max(mult * 1.2, 2.2)
+
+    def pt(t):
+        m = math.exp(rate * t)
+        x = gx0 + 22 * k + (gx1 - gx0 - 60 * k) * (t / T)
+        y = gy1 - 20 * k - (gy1 - gy0 - 50 * k) * ((m - 1) / (top - 1))
+        return x, y
+    steps = 70
+    pts = [pt(t_now * i / steps) for i in range(steps + 1)]
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    col = {"running": (120, 210, 255), "cashed": (110, 230, 140), "crashed": (255, 96, 84)}[status]
+    od.polygon(pts + [(pts[-1][0], gy1 - 12 * k), (pts[0][0], gy1 - 12 * k)], fill=col + (46,))
+    od.line(pts, fill=col + (255,), width=int(6 * k), joint="curve")
+    ex, ey = pts[-1]
+    if status == "crashed":
+        for i in range(12):
+            a = math.radians(i * 30)
+            r0, r1 = 14 * k, (34 if i % 2 == 0 else 22) * k
+            od.line([(ex + math.cos(a) * r0, ey + math.sin(a) * r0), (ex + math.cos(a) * r1, ey + math.sin(a) * r1)], fill=(255, 190, 70, 255), width=int(4 * k))
+        od.ellipse((ex - 12 * k, ey - 12 * k, ex + 12 * k, ey + 12 * k), fill=(255, 240, 180, 255))
+    else:
+        gl = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(gl).ellipse((ex - 22 * k, ey - 22 * k, ex + 22 * k, ey + 22 * k), fill=col + (140,))
+        gl = gl.filter(ImageFilter.GaussianBlur(8 * k))
+        ov.alpha_composite(gl)
+        od = ImageDraw.Draw(ov)
+        od.ellipse((ex - 8 * k, ey - 8 * k, ex + 8 * k, ey + 8 * k), fill=(255, 255, 255, 255))
+    img.alpha_composite(ov)
+    d = ImageDraw.Draw(img)
+    shown = crash_mult if status == "crashed" else (cash_mult if status == "cashed" else mult)
+    tcol = {"running": (255, 255, 255), "cashed": (130, 240, 160), "crashed": (255, 120, 108)}[status]
+    _text(d, (W * k / 2, 196 * k), f"x{shown:.2f}", int(88 * k), tcol + (255,), "mm", stroke_width=int(3 * k), stroke_fill=(0, 0, 0, 170))
+    sub = {"running": "اضغط اسحب قبل ما ينفجر!", "cashed": f"سحبت بنجاح!  (كان بينفجر عند x{(crash_mult or 0):.2f})", "crashed": "انفجر!"}[status]
+    sw = min(620 * k, _text_w(sub, int(24 * k)) + 50 * k)
+    d.rounded_rectangle((W * k / 2 - sw / 2, 240 * k, W * k / 2 + sw / 2, 284 * k), radius=16 * k, fill=(8, 6, 16, 215))
+    _text_fit(d, (W * k / 2, 262 * k), sub, int(24 * k), (255, 240, 205, 255), "mm", 600 * k)
+    cur = int(bet * (shown if status != "crashed" else 0))
+    lab = {"running": "لو سحبت الحين", "cashed": "ربحك", "crashed": "خسرت"}[status]
+    val = fmt_money(cur) if status == "running" else (f"+{fmt_money(cur - bet)}" if status == "cashed" else f"-{fmt_money(bet)}")
+    d.rounded_rectangle((50 * k, 378 * k, 360 * k, 432 * k), radius=18 * k, fill=(20, 12, 8, 220), outline=(224, 186, 90, 200), width=int(2 * k))
+    _text(d, (205 * k, 394 * k), "الرهان", int(14 * k), (210, 180, 130, 255), "mm")
+    _text_fit(d, (205 * k, 417 * k), fmt_money(bet), int(24 * k), (255, 255, 255, 255), "mm", 270 * k)
+    d.rounded_rectangle((400 * k, 378 * k, (W - 50) * k, 432 * k), radius=18 * k, fill=(20, 12, 8, 220), outline=tcol + (255,), width=int(2 * k))
+    _text(d, ((400 + (W - 50 - 400) / 2) * k, 394 * k), lab, int(14 * k), (210, 180, 130, 255), "mm")
+    _text_fit(d, ((400 + (W - 50 - 400) / 2) * k, 417 * k), val, int(24 * k), tcol + (255,), "mm", 270 * k)
+    return _to_png(img, (W, H))
+
+
+# ------------------------------- من سيربح المليون -------------------------------
+MILLION_LADDER = [300, 600, 1200, 2500, 5000, 10000, 20000, 40000, 75000, 150000]
+MILLION_SAFE = {3, 6}          # مستويات آمنة (لو غلطت بعدها تنزل لها)
+_AR_LETTERS = ["أ", "ب", "ج", "د"]
+
+
+def _wrap_text(text, size, max_w):
+    words, lines, cur = str(text).split(), [], ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        if cur and _text_w(t, size) > max_w:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = t
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+def _render_million_sync(avatar, name, level, question, options, removed, picked=None, correct=None, banner=None, tone=None, prize_now=0) -> io.BytesIO:
+    """level: 1..10 (السؤال الحالي) | picked/correct: فهارس الخيارات بعد الإجابة"""
+    k, W, H = 2, 860, 560
+    img, d = _mf_canvas(W, H, "vote", k)
+    try:
+        av = _circle_avatar(avatar, 50 * k)
+        d.ellipse((28 * k - 3 * k, 22 * k - 3 * k, 28 * k + 53 * k, 22 * k + 53 * k), fill=(224, 186, 90, 255))
+        img.alpha_composite(av, (28 * k, 22 * k))
+        d = ImageDraw.Draw(img)
+    except Exception:
+        pass
+    _text_fit(d, (92 * k, 40 * k), _trunc(name, 16), int(23 * k), (255, 255, 255, 255), "lm", 280 * k)
+    _text(d, (92 * k, 66 * k), "من سيربح المليون", int(17 * k), (236, 205, 140, 255), "lm")
+    # السلم
+    lx0 = 660
+    for i in range(10, 0, -1):
+        y = 40 + (10 - i) * 48
+        cur = (i == level and banner is None) or (i == level and picked is not None)
+        passed = i < level
+        fill = (224, 186, 90, 255) if cur else ((46, 90, 62, 235) if passed else (30, 16, 10, 220))
+        d.rounded_rectangle((lx0 * k, y * k, (W - 26) * k, (y + 40) * k), radius=12 * k, fill=fill, outline=((236, 205, 140, 200) if i in MILLION_SAFE else (224, 186, 90, 70)), width=int(1.6 * k))
+        tc = (40, 20, 6, 255) if cur else (255, 255, 255, 255)
+        _text(d, ((lx0 + 16) * k, (y + 20) * k), str(i), int(18 * k), tc if cur else (210, 180, 130, 255), "lm")
+        _text_fit(d, ((W - 40) * k, (y + 20) * k), fmt_money(MILLION_LADDER[i - 1]), int(20 * k), tc, "rm", 120 * k)
+    # السؤال
+    qx0, qx1 = 30, 640
+    d.rounded_rectangle((qx0 * k, 104 * k, qx1 * k, 250 * k), radius=22 * k, fill=(24, 14, 10, 235), outline=(224, 186, 90, 255), width=int(2.4 * k))
+    size = 30
+    lines = _wrap_text(question, size * k, (qx1 - qx0 - 50) * k)
+    while len(lines) > 3 and size > 20:
+        size -= 3
+        lines = _wrap_text(question, size * k, (qx1 - qx0 - 50) * k)
+    lh = size * 1.45
+    y0 = 177 - lh * (len(lines) - 1) / 2
+    for i, ln in enumerate(lines):
+        _text(d, (((qx0 + qx1) / 2) * k, (y0 + i * lh) * k), ln, int(size * k), (255, 255, 255, 255), "mm")
+    # الخيارات 2x2
+    for i, opt in enumerate(options):
+        r_, c_ = divmod(i, 2)
+        x0 = qx0 + c_ * 312
+        y0_ = 272 + r_ * 98
+        if i in removed:
+            fill, outl, tc = (20, 12, 8, 160), (90, 70, 50, 120), (120, 100, 80, 255)
+        elif correct is not None and i == correct:
+            fill, outl, tc = (40, 130, 70, 255), (150, 255, 180, 255), (255, 255, 255, 255)
+        elif picked is not None and i == picked:
+            fill, outl, tc = (150, 40, 44, 255), (255, 150, 140, 255), (255, 255, 255, 255)
+        else:
+            fill, outl, tc = (60, 34, 20, 255), (224, 186, 90, 255), (255, 255, 255, 255)
+        d.rounded_rectangle((x0 * k, y0_ * k, (x0 + 298) * k, (y0_ + 84) * k), radius=20 * k, fill=fill, outline=outl, width=int(2.2 * k))
+        d.ellipse(((x0 + 238 + 24) * k - 20 * k, (y0_ + 42) * k - 20 * k, (x0 + 238 + 24) * k + 20 * k, (y0_ + 42) * k + 20 * k), fill=(224, 186, 90, 255) if i not in removed else (90, 70, 50, 255))
+        _text(d, ((x0 + 262) * k, (y0_ + 42) * k), _AR_LETTERS[i], int(24 * k), (40, 20, 6, 255), "mm")
+        if i not in removed:
+            _text_fit(d, ((x0 + 224) * k, (y0_ + 42) * k), opt, int(22 * k), tc, "rm", 205 * k)
+    # أسفل
+    if banner:
+        col = {"win": (110, 230, 140), "lose": (240, 110, 100), "push": (236, 205, 140)}[tone]
+        d.rounded_rectangle((30 * k, 484 * k, 640 * k, 540 * k), radius=20 * k, fill=(14, 8, 5, 235), outline=col + (255,), width=int(2.2 * k))
+        _text_fit(d, (335 * k, 512 * k), banner, int(26 * k), col + (255,), "mm", 570 * k)
+    else:
+        _text(d, (335 * k, 512 * k), f"رصيدك المضمون الحين: {fmt_money(prize_now)}", int(22 * k), (236, 205, 140, 255), "mm")
+    return _to_png(img, (W, H))
+
+
+# ------------------------------- أيقونات الأغراض + بطاقة عرض لاعب -------------------------------
+def _draw_item_icon(d, cx, cy, s, key, A=255):
+    W_ = (255, 255, 255, A)
+    G = (240, 200, 70, A)
+    if key == "gold":
+        for bx, by, w in ((0, -.22, .62), (-.3, .2, .62), (.3, .2, .62)):
+            x, y = cx + bx * s, cy + by * s
+            d.polygon([(x - w * s * .5, y + .22 * s), (x - w * s * .36, y - .2 * s), (x + w * s * .36, y - .2 * s), (x + w * s * .5, y + .22 * s)], fill=G, outline=(150, 100, 20, A))
+    elif key == "stocks":
+        d.line([(cx - .42 * s, cy + .3 * s), (cx - .14 * s, cy - .02 * s), (cx + .08 * s, cy + .14 * s), (cx + .4 * s, cy - .32 * s)], fill=(110, 230, 140, A), width=max(3, int(s * .09)), joint="curve")
+        d.polygon([(cx + .42 * s, cy - .4 * s), (cx + .42 * s, cy - .12 * s), (cx + .16 * s, cy - .3 * s)], fill=(110, 230, 140, A))
+    elif key == "car":
+        d.rounded_rectangle((cx - .46 * s, cy - .02 * s, cx + .46 * s, cy + .24 * s), radius=int(s * .08), fill=(226, 70, 70, A))
+        d.polygon([(cx - .26 * s, cy - .02 * s), (cx - .14 * s, cy - .24 * s), (cx + .18 * s, cy - .24 * s), (cx + .32 * s, cy - .02 * s)], fill=(226, 70, 70, A))
+        d.polygon([(cx - .17 * s, cy - .02 * s), (cx - .09 * s, cy - .18 * s), (cx + .1 * s, cy - .18 * s), (cx + .1 * s, cy - .02 * s)], fill=(170, 220, 250, A))
+        for wx in (-.28, .28):
+            d.ellipse((cx + wx * s - .1 * s, cy + .16 * s, cx + wx * s + .1 * s, cy + .36 * s), fill=(30, 30, 36, A), outline=W_)
+    elif key == "house":
+        d.polygon([(cx - .46 * s, cy - .04 * s), (cx, cy - .44 * s), (cx + .46 * s, cy - .04 * s)], fill=(210, 90, 70, A))
+        d.rectangle((cx - .34 * s, cy - .04 * s, cx + .34 * s, cy + .38 * s), fill=(250, 232, 190, A))
+        d.rectangle((cx - .08 * s, cy + .1 * s, cx + .1 * s, cy + .38 * s), fill=(150, 90, 50, A))
+    elif key == "land":
+        d.polygon([(cx - .48 * s, cy + .3 * s), (cx - .3 * s, cy - .06 * s), (cx + .5 * s, cy - .06 * s), (cx + .34 * s, cy + .3 * s)], fill=(90, 190, 100, A), outline=(40, 110, 50, A))
+        d.line([(cx, cy - .06 * s), (cx, cy - .42 * s)], fill=W_, width=max(2, int(s * .05)))
+        d.polygon([(cx, cy - .42 * s), (cx + .24 * s, cy - .32 * s), (cx, cy - .22 * s)], fill=(226, 70, 70, A))
+    elif key == "store":
+        d.rectangle((cx - .38 * s, cy - .06 * s, cx + .38 * s, cy + .38 * s), fill=(250, 232, 190, A))
+        for i in range(4):
+            x0 = cx - .44 * s + i * .22 * s
+            d.polygon([(x0, cy - .32 * s), (x0 + .22 * s, cy - .32 * s), (x0 + .26 * s, cy - .04 * s), (x0 - .04 * s, cy - .04 * s)], fill=((226, 70, 70, A) if i % 2 == 0 else (255, 255, 255, A)))
+        d.rectangle((cx - .1 * s, cy + .12 * s, cx + .1 * s, cy + .38 * s), fill=(150, 90, 50, A))
+    elif key == "building":
+        d.rectangle((cx - .26 * s, cy - .46 * s, cx + .26 * s, cy + .4 * s), fill=(170, 190, 220, A), outline=W_)
+        for r_ in range(5):
+            for c_ in range(2):
+                d.rectangle((cx - .17 * s + c_ * .22 * s, cy - .38 * s + r_ * .16 * s, cx - .05 * s + c_ * .22 * s, cy - .28 * s + r_ * .16 * s), fill=(255, 236, 160, A))
+    else:  # company / factory
+        d.rectangle((cx - .46 * s, cy - .04 * s, cx + .46 * s, cy + .38 * s), fill=(150, 150, 168, A), outline=W_)
+        for i in range(3):
+            x0 = cx - .44 * s + i * .3 * s
+            d.polygon([(x0, cy - .04 * s), (x0, cy - .26 * s), (x0 + .24 * s, cy - .04 * s)], fill=(150, 150, 168, A))
+        d.rectangle((cx + .22 * s, cy - .42 * s, cx + .38 * s, cy - .04 * s), fill=(120, 120, 138, A))
+        d.ellipse((cx + .16 * s, cy - .56 * s, cx + .42 * s, cy - .4 * s), fill=(220, 220, 230, 160))
+
+
+TRADE_ITEM_LABEL = {"gold": "Gold", "stocks": "سهم", "car": "سياره", "house": "بيت", "land": "اراضي", "store": "متجر", "building": "مبنى", "company": "شركه"}
+
+
+def _render_listing_sync(lid, item, count, price, seller_name, seller_av, tax, state="open", buyer_name=None) -> io.BytesIO:
+    k, W, H = 2, 760, 340
+    theme = {"open": "lobby", "sold": "town", "cancel": "dead"}[state]
+    img, d = _mf_canvas(W, H, theme, k)
+    d.ellipse((50 * k, 70 * k, 230 * k, 250 * k), fill=(30, 16, 10, 255), outline=(224, 186, 90, 255), width=int(3 * k))
+    _draw_item_icon(d, 140 * k, 160 * k, 120 * k, item)
+    lab = f"{TRADE_ITEM_LABEL[item]} x{count}" if item == "gold" else f"{TRADE_ITEM_LABEL[item]} × {count}"
+    _text(d, (W * k - 40 * k, 62 * k), f"عرض #{lid}", int(34 * k), (255, 255, 255, 255), "rm")
+    _text_fit(d, (W * k - 40 * k, 112 * k), lab, int(40 * k), (255, 224, 140, 255), "rm", 470 * k)
+    d.rounded_rectangle((270 * k, 140 * k, (W - 40) * k, 206 * k), radius=20 * k, fill=(20, 12, 8, 230), outline=(110, 220, 140, 255), width=int(2 * k))
+    _text(d, (290 * k, 173 * k), "السعر", int(18 * k), (210, 180, 130, 255), "lm")
+    _text_fit(d, ((W - 58) * k, 173 * k), fmt_money(price), int(34 * k), (130, 240, 160, 255), "rm", 330 * k)
+    try:
+        av = _circle_avatar(seller_av, 40 * k)
+        d.ellipse((270 * k - 3 * k, 226 * k - 3 * k, 270 * k + 43 * k, 226 * k + 43 * k), fill=(224, 186, 90, 255))
+        img.alpha_composite(av, (270 * k, 226 * k))
+        d = ImageDraw.Draw(img)
+    except Exception:
+        pass
+    _text_fit(d, (322 * k, 240 * k), f"البائع: {_trunc(seller_name, 14)}", int(20 * k), (255, 255, 255, 255), "lm", 330 * k)
+    _text(d, (322 * k, 268 * k), f"رسوم البيع {int(tax * 100)}٪ من المبلغ", int(15 * k), (255, 255, 255, 150), "lm")
+    if state != "open":
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(ov).rounded_rectangle((20 * k, 20 * k, (W - 20) * k, (H - 20) * k), radius=30 * k, fill=(0, 0, 0, 205))
+        img.alpha_composite(ov)
+        d = ImageDraw.Draw(img)
+        txt = "تم البيع" if state == "sold" else "تم إلغاء العرض"
+        col = (130, 240, 160) if state == "sold" else (255, 130, 120)
+        _text(d, (W * k / 2, (H / 2 - 20) * k), txt, int(72 * k), col + (255,), "mm", stroke_width=int(3 * k), stroke_fill=(0, 0, 0, 200))
+        if buyer_name and state == "sold":
+            _text_fit(d, (W * k / 2, (H / 2 + 50) * k), f"المشتري: {_trunc(buyer_name, 16)}  •  {fmt_money(price)}", int(26 * k), (255, 255, 255, 240), "mm", 560 * k)
+    return _to_png(img, (W, H))
+
+
+# =====================================================================
+#   🎰🧠🤝🏠🏦  بلاك جاك / كراش / من سيربح المليون / صفقات اللاعبين / دخل الممتلكات / قروض البنك
+# =====================================================================
+BANK_COOLDOWNS.update({"بلاكجاك": 30, "كراش": 60, "مليون": 600})
+_i = BANK_STATUS_ORDER.index("لعبه") if "لعبه" in BANK_STATUS_ORDER else len(BANK_STATUS_ORDER)
+BANK_STATUS_ORDER[_i:_i] = ["بلاكجاك", "كراش", "مليون"]
+
+BJ_MIN_BET = CRASH_MIN_BET = 100
+CRASH_RATE = 0.18            # سرعة صعود المضاعف: x2 بعد ~3.9 ثانية و x10 بعد ~12.8 ثانية
+CRASH_TICK = 1.3             # كل كم ثانية تتحدث الصورة (حد ديسكورد للتعديل)
+TRADE_TAX = 0.05             # رسوم البيع بين اللاعبين (تروح للبنك)
+TRADE_MAX_OPEN = 5
+INCOME_PER_HOUR = {"car": 30, "house": 60, "land": 150, "store": 160, "building": 450, "company": 1250}
+INCOME_CAP_HOURS = 24        # أقصى تراكم للدخل (لازم تحصّل يومياً)
+LOAN_INTEREST = 0.10
+LOAN_HOURS = 24
+LOAN_MIN, LOAN_MAX, LOAN_WORTH_RATIO = 500, 250000, 0.5
+LOAN_LATE_PENALTY = 0.10
+_BG_TASKS: set = set()
+
+
+def _spawn(coro):
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
+
+
+async def _reply_file(message, text, buf, name):
+    return await message.reply(content=text, file=discord.File(buf, filename=name), mention_author=False)
+
+
+# =====================================================================
+#                              🃏  بلاك جاك
+# =====================================================================
+BJ_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+
+def bj_new_deck(rng=random):
+    deck = [(r, s) for r in BJ_RANKS for s in "HDCS"]
+    rng.shuffle(deck)
+    return deck
+
+
+def bj_is_blackjack(cards) -> bool:
+    return len(cards) == 2 and _bj_value(cards) == 21
+
+
+def bj_settle(player, dealer):
+    """يرجع (النتيجة, مضاعف الإرجاع من الرهان الكلي): win=2x | blackjack=2.5x | push=1x | lose=0"""
+    pv, dv = _bj_value(player), _bj_value(dealer)
+    if pv > 21:
+        return "lose", 0.0
+    if bj_is_blackjack(player):
+        return ("push", 1.0) if bj_is_blackjack(dealer) else ("win", 2.5)
+    if bj_is_blackjack(dealer):
+        return "lose", 0.0
+    if dv > 21 or pv > dv:
+        return "win", 2.0
+    if pv == dv:
+        return "push", 1.0
+    return "lose", 0.0
+
+
+class BlackjackGame(discord.ui.View):
+    def __init__(self, user, avatar: bytes, bet: int):
+        super().__init__(timeout=90)
+        self.user, self.avatar, self.bet = user, avatar, bet
+        self.name = _clean_name(user.display_name)
+        self.deck = bj_new_deck()
+        self.player = [self.deck.pop()]
+        self.dealer = [self.deck.pop()]
+        self.player.append(self.deck.pop())
+        self.dealer.append(self.deck.pop())
+        self.done = False
+        self.message = None
+        self.lock = asyncio.Lock()
+        for label, style, cb in (("🃏 سحب ورقة", discord.ButtonStyle.primary, self._hit), ("✋ وقوف", discord.ButtonStyle.success, self._stand),
+                                 ("✖️2 مضاعفة", discord.ButtonStyle.secondary, self._double)):
+            b = discord.ui.Button(label=label, style=style)
+            b.callback = cb
+            self.add_item(b)
+        self.double_btn = self.children[2]
+
+    async def _show(self, reveal=False, banner=None, tone=None, content=None, final=False):
+        buf = await _run_sync(_render_blackjack_sync, self.avatar, self.name, self.bet, self.player, self.dealer, reveal, banner, tone)
+        kw = dict(content=content, attachments=[discord.File(buf, filename="bj.png")], view=None if final else self)
+        if self.message is None:
+            return buf
+        try:
+            await self.message.edit(**kw)
+        except Exception as e:
+            print(f"⚠️ بلاك جاك: تعذر تعديل الرسالة: {e}")
+        return buf
+
+    async def start(self, message):
+        """يرسل اللعبة. لو اللاعب جاب بلاك جاك مباشرة تنحسم فوراً."""
+        buf = await _run_sync(_render_blackjack_sync, self.avatar, self.name, self.bet, self.player, self.dealer, False, None, None)
+        self.message = await message.reply(content=f"🃏 {self.user.mention} • رهانك **{fmt_money(self.bet)}**", file=discord.File(buf, filename="bj.png"),
+                                           view=self, mention_author=False)
+        if bj_is_blackjack(self.player):
+            async with self.lock:
+                await self._finish()
+
+    async def _finish(self):
+        if self.done:
+            return
+        self.done = True
+        if _bj_value(self.player) <= 21 and not bj_is_blackjack(self.player):
+            while _bj_value(self.dealer) < 17:
+                self.dealer.append(self.deck.pop())
+        outcome, mult = bj_settle(self.player, self.dealer)
+        pay = int(self.bet * mult)
+        if pay:
+            update_balance(self.user.id, pay)
+        profit = pay - self.bet
+        if bj_is_blackjack(self.player) and outcome == "win":
+            banner = f"بلاك جاك! {_signed(profit)}"
+        elif outcome == "win":
+            banner = f"فزت! {_signed(profit)}"
+        elif outcome == "push":
+            banner = "تعادل - رجع لك رهانك"
+        else:
+            banner = f"خسرت {_signed(profit)}" if _bj_value(self.player) <= 21 else f"تجاوزت 21! {_signed(profit)}"
+        tone = {"win": "win", "push": "push", "lose": "lose"}[outcome]
+        bal = get_balance(self.user.id)
+        self.stop()
+        await self._show(True, banner, tone, content=f"🃏 {self.user.mention} • رصيدك: **{fmt_money(bal)}**", final=True)
+
+    async def _guard(self, interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("❌ هذي مو لعبتك!", ephemeral=True)
+            return False
+        await interaction.response.defer()
+        return True
+
+    def _drop_double(self):
+        if self.double_btn in self.children:
+            self.remove_item(self.double_btn)
+
+    async def _hit(self, interaction):
+        if not await self._guard(interaction):
+            return
+        async with self.lock:
+            if self.done:
+                return
+            self._drop_double()
+            self.player.append(self.deck.pop())
+            if _bj_value(self.player) >= 21:
+                return await self._finish()
+            await self._show(False, content=f"🃏 {self.user.mention} • رهانك **{fmt_money(self.bet)}**")
+
+    async def _stand(self, interaction):
+        if not await self._guard(interaction):
+            return
+        async with self.lock:
+            if not self.done:
+                await self._finish()
+
+    async def _double(self, interaction):
+        if not await self._guard(interaction):
+            return
+        async with self.lock:
+            if self.done:
+                return
+            if len(self.player) != 2:
+                return
+            if get_balance(self.user.id) < self.bet:
+                return await interaction.followup.send("❌ رصيدك ما يكفي للمضاعفة.", ephemeral=True)
+            update_balance(self.user.id, -self.bet)
+            self.bet *= 2
+            self.player.append(self.deck.pop())
+            await self._finish()
+
+    async def on_timeout(self):
+        async with self.lock:
+            if not self.done:
+                await self._finish()
+
+
+async def cmd_blackjack(message, amount):
+    user = message.author
+    if amount is None:
+        return await message.reply("❌ حدد الرهان: `بلاك جاك 500` أو `بلاك جاك نص` أو `بلاك جاك كامل`", mention_author=False)
+    err, bal = _bet_check(user, amount, BJ_MIN_BET)
+    if err:
+        return await message.reply(err, mention_author=False)
+    set_cooldown(user.id, "بلاكجاك")
+    update_balance(user.id, -amount)
+    game = BlackjackGame(user, await _avatar_bytes(user), amount)
+    await game.start(message)
+
+
+# =====================================================================
+#                              🚀  كراش
+# =====================================================================
+def crash_point(rng=random) -> float:
+    """نقطة الانفجار: P(x >= m) = 0.97/m  => عائد 97% لأي استراتيجية سحب (هامش البنك 3%)."""
+    r = rng.random()
+    x = 0.97 / max(1e-9, 1.0 - r)
+    return 1.0 if x < 1.0 else min(200.0, math.floor(x * 100) / 100)
+
+
+def crash_mult_at(t: float) -> float:
+    return math.floor(math.exp(CRASH_RATE * t) * 100) / 100
+
+
+def crash_time_for(m: float) -> float:
+    return math.log(m) / CRASH_RATE
+
+
+class CrashGame(discord.ui.View):
+    def __init__(self, user, avatar: bytes, bet: int, auto):
+        super().__init__(timeout=None)
+        self.user, self.avatar, self.bet, self.auto = user, avatar, bet, auto
+        self.name = _clean_name(user.display_name)
+        self.crash = crash_point()
+        self.t_crash = crash_time_for(self.crash) if self.crash > 1.0 else 0.0
+        self.t_auto = crash_time_for(auto) if (auto and auto < self.crash) else None
+        self.status = "running"
+        self.t0 = None
+        self.message = None
+        self.lock = asyncio.Lock()
+        b = discord.ui.Button(label="💰 اسحب الحين!", style=discord.ButtonStyle.success)
+        b.callback = self._cash
+        self.add_item(b)
+
+    async def _edit(self, status, mult, t, content, final=False, cash_mult=None):
+        buf = await _run_sync(_render_crash_sync, self.avatar, self.name, self.bet, mult, t, status,
+                              self.crash if status != "running" else None, cash_mult, self.auto, CRASH_RATE)
+        try:
+            await self.message.edit(content=content, attachments=[discord.File(buf, filename="crash.png")], view=None if final else self)
+        except Exception as e:
+            print(f"⚠️ كراش: تعذر تعديل الرسالة: {e}")
+
+    async def _cash_out(self, m, t):
+        self.status = "cashed"
+        pay = int(self.bet * m)
+        nb = update_balance(self.user.id, pay)
+        self.stop()
+        await self._edit("cashed", m, t, f"💰 {self.user.mention} سحبت عند **x{m:.2f}** وربحت **{fmt_money(pay - self.bet)}** • رصيدك: **{fmt_money(nb)}**",
+                         final=True, cash_mult=m)
+
+    async def _crash_now(self):
+        self.status = "crashed"
+        bal = get_balance(self.user.id)
+        self.stop()
+        await self._edit("crashed", self.crash, max(self.t_crash, 0.5), f"💥 {self.user.mention} انفجر عند **x{self.crash:.2f}** وخسرت **{fmt_money(self.bet)}** • رصيدك: **{fmt_money(bal)}**",
+                         final=True)
+
+    async def _cash(self, interaction):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("❌ هذي مو لعبتك!", ephemeral=True)
+        await interaction.response.defer()
+        async with self.lock:
+            if self.status != "running" or self.t0 is None:
+                return
+            t = time.monotonic() - self.t0
+            m = crash_mult_at(t)
+            if m >= self.crash or t >= self.t_crash:
+                await self._crash_now()
+            else:
+                await self._cash_out(m, t)
+
+    async def play(self):
+        try:
+            self.t0 = time.monotonic()
+            while True:
+                t = time.monotonic() - self.t0
+                nxt = max(self.t_crash, 0.9)
+                if self.t_auto is not None:
+                    nxt = min(nxt, self.t_auto)
+                await asyncio.sleep(min(CRASH_TICK, max(0.05, nxt - t)))
+                async with self.lock:
+                    if self.status != "running":
+                        return
+                    t = time.monotonic() - self.t0
+                    if self.t_auto is not None and t >= self.t_auto:
+                        return await self._cash_out(self.auto, self.t_auto)
+                    if t >= self.t_crash and t >= 0.9 - 1e-6:
+                        return await self._crash_now()
+                    await self._edit("running", crash_mult_at(t), t, f"🚀 {self.user.mention} • اسحب قبل ما ينفجر!")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            async with self.lock:
+                if self.status == "running":
+                    self.status = "error"
+                    update_balance(self.user.id, self.bet)         # رجّع الرهان لو صار خطأ
+                    try:
+                        await self.message.edit(content=f"⚠️ صار خطأ بالكراش ورجعت لك رهانك ({fmt_money(self.bet)}).", view=None)
+                    except Exception:
+                        pass
+
+
+def _parse_float(tok: str):
+    try:
+        return float(tok.translate(_DIGIT_TABLE).lower().replace("x", "").replace("×", "").replace("٫", "."))
+    except Exception:
+        return None
+
+
+async def cmd_crash(message, rest):
+    user = message.author
+    amount = parse_amount_ctx(rest[:1], user.id) if rest else None
+    if amount is None:
+        return await message.reply("❌ حدد الرهان: `كراش 500` أو مع سحب تلقائي: `كراش 500 2.5` (يسحب لك لما يوصل x2.5)", mention_author=False)
+    auto = None
+    if len(rest) > 1:
+        auto = _parse_float(rest[1])
+        if auto is None or not (1.1 <= auto <= 100):
+            return await message.reply("❌ السحب التلقائي لازم يكون بين **1.1** و **100**، مثال: `كراش 500 2.5`", mention_author=False)
+    err, bal = _bet_check(user, amount, CRASH_MIN_BET)
+    if err:
+        return await message.reply(err, mention_author=False)
+    set_cooldown(user.id, "كراش")
+    update_balance(user.id, -amount)
+    game = CrashGame(user, await _avatar_bytes(user), amount, auto)
+    buf = await _run_sync(_render_crash_sync, game.avatar, game.name, amount, 1.0, 6.0, "running", None, None, auto, CRASH_RATE)
+    game.message = await message.reply(content=f"🚀 {user.mention} • رهانك **{fmt_money(amount)}**" + (f" • سحب تلقائي x{auto:.2f}" if auto else ""),
+                                       file=discord.File(buf, filename="crash.png"), view=game, mention_author=False)
+    _spawn(game.play())
+
+
+# =====================================================================
+#                         🧠  من سيربح المليون
+# =====================================================================
+MILLION_QUESTIONS = {
+    1: [("ما عاصمة المملكة العربية السعودية؟", "الرياض", ["جدة", "مكة المكرمة", "الدمام"]),
+        ("كم عدد أضلاع المثلث؟", "3", ["4", "5", "6"]),
+        ("أي حيوان يلقّب بملك الغابة؟", "الأسد", ["النمر", "الفيل", "الذئب"]),
+        ("ما لون السماء في يوم صافٍ؟", "أزرق", ["أخضر", "أحمر", "أصفر"]),
+        ("كم عدد أيام الأسبوع؟", "7", ["5", "6", "8"])],
+    2: [("ما أكبر كوكب في المجموعة الشمسية؟", "المشتري", ["الأرض", "المريخ", "زحل"]),
+        ("كم عدد ألوان قوس قزح؟", "7", ["5", "6", "8"]),
+        ("ما عاصمة مصر؟", "القاهرة", ["الإسكندرية", "الجيزة", "أسوان"]),
+        ("ما الغاز الذي نتنفسه لنعيش؟", "الأكسجين", ["النيتروجين", "الهيدروجين", "ثاني أكسيد الكربون"])],
+    3: [("ما الكوكب المعروف بالكوكب الأحمر؟", "المريخ", ["عطارد", "الزهرة", "زحل"]),
+        ("ما أكبر محيط في العالم؟", "المحيط الهادئ", ["المحيط الأطلسي", "المحيط الهندي", "المحيط المتجمد الشمالي"]),
+        ("كم عدد القارات في العالم؟", "7", ["5", "6", "8"]),
+        ("في أي قارة تقع مصر؟", "أفريقيا", ["آسيا", "أوروبا", "أمريكا الجنوبية"])],
+    4: [("من مخترع المصباح الكهربائي؟", "توماس إديسون", ["نيكولا تسلا", "ألكسندر بيل", "إسحاق نيوتن"]),
+        ("ما عاصمة اليابان؟", "طوكيو", ["كيوتو", "أوساكا", "هيروشيما"]),
+        ("كم عدد لاعبي كل فريق داخل الملعب في كرة القدم؟", "11", ["9", "10", "12"]),
+        ("ما أصغر دولة في العالم مساحةً؟", "الفاتيكان", ["موناكو", "مالطا", "سان مارينو"])],
+    5: [("في أي عام انتهت الحرب العالمية الثانية؟", "1945", ["1939", "1918", "1950"]),
+        ("ما الرمز الكيميائي للذهب؟", "Au", ["Ag", "Gd", "Go"]),
+        ("ما عاصمة أستراليا؟", "كانبرا", ["سيدني", "ملبورن", "بيرث"]),
+        ("من رسم لوحة الموناليزا؟", "ليوناردو دا فينشي", ["بيكاسو", "فان غوخ", "مايكل أنجلو"])],
+    6: [("ما أكبر دولة في العالم من حيث المساحة؟", "روسيا", ["كندا", "الصين", "الولايات المتحدة"]),
+        ("كم عدد عظام جسم الإنسان البالغ؟", "206", ["186", "212", "300"]),
+        ("ما العملة الرسمية لليابان؟", "الين", ["اليوان", "الوون", "الروبية"]),
+        ("من مؤلف رواية «البؤساء»؟", "فيكتور هوغو", ["تولستوي", "ديكنز", "بلزاك"])],
+    7: [("ما أسرع حيوان بري في العالم؟", "الفهد", ["الأسد", "الحصان", "الغزال"]),
+        ("من أول إنسان سافر إلى الفضاء؟", "يوري غاغارين", ["نيل أرمسترونغ", "جون غلين", "ألان شيبرد"]),
+        ("ما أطول سلسلة جبال فوق اليابسة؟", "جبال الأنديز", ["جبال الهيمالايا", "جبال الألب", "جبال روكي"]),
+        ("ما العنصر الأكثر وفرة في القشرة الأرضية؟", "الأكسجين", ["السيليكون", "الحديد", "الألومنيوم"])],
+    8: [("في أي عام تم توحيد المملكة العربية السعودية؟", "1932", ["1902", "1945", "1924"]),
+        ("ما عاصمة كندا؟", "أوتاوا", ["تورنتو", "مونتريال", "فانكوفر"]),
+        ("ما العدد الأولي الوحيد الذي هو زوجي؟", "2", ["0", "4", "6"]),
+        ("ما أكبر دولة في العالم من حيث عدد السكان حالياً؟", "الهند", ["الصين", "الولايات المتحدة", "إندونيسيا"])],
+    9: [("ما عاصمة تركيا؟", "أنقرة", ["إسطنبول", "إزمير", "بورصة"]),
+        ("ما أبعد كوكب عن الشمس في مجموعتنا الشمسية؟", "نبتون", ["أورانوس", "زحل", "بلوتو"]),
+        ("كم تبلغ سرعة الضوء تقريباً بالكيلومتر في الثانية؟", "300,000", ["30,000", "3,000", "3,000,000"]),
+        ("ما عاصمة نيجيريا؟", "أبوجا", ["لاغوس", "كانو", "إبادان"])],
+    10: [("من هو العالم الملقّب بأبي الجبر؟", "الخوارزمي", ["ابن الهيثم", "الرازي", "البيروني"]),
+         ("من مؤلف كتاب «المقدمة» في علم الاجتماع؟", "ابن خلدون", ["ابن سينا", "ابن رشد", "ابن بطوطة"]),
+         ("في أي عام فتح العثمانيون القسطنطينية؟", "1453", ["1492", "1258", "1517"]),
+         ("من مؤلف كتاب «القانون في الطب»؟", "ابن سينا", ["الرازي", "ابن النفيس", "ابن رشد"])],
+}
+
+
+def million_safe_prize(answered: int) -> int:
+    if answered >= 6:
+        return MILLION_LADDER[5]
+    if answered >= 3:
+        return MILLION_LADDER[2]
+    return 0
+
+
+def million_walk_prize(answered: int) -> int:
+    return MILLION_LADDER[answered - 1] if answered > 0 else 0
+
+
+class MillionGame(discord.ui.View):
+    def __init__(self, user, avatar: bytes):
+        super().__init__(timeout=75)
+        self.user, self.avatar = user, avatar
+        self.name = _clean_name(user.display_name)
+        self.level, self.answered = 1, 0
+        self.used: set = set()
+        self.removed: set = set()
+        self.fifty_used = False
+        self.finished = False
+        self.busy = False
+        self.message = None
+        self.lock = asyncio.Lock()
+        self._load_question()
+        self._build()
+
+    def _load_question(self):
+        pool = [i for i in range(len(MILLION_QUESTIONS[self.level])) if (self.level, i) not in self.used] or list(range(len(MILLION_QUESTIONS[self.level])))
+        idx = random.choice(pool)
+        self.used.add((self.level, idx))
+        q, correct, wrong = MILLION_QUESTIONS[self.level][idx]
+        opts = [correct] + list(wrong)
+        random.shuffle(opts)
+        self.q, self.options, self.correct = q, opts, opts.index(correct)
+        self.removed = set()
+
+    def _build(self, disable=False):
+        self.clear_items()
+        for i in range(4):
+            b = discord.ui.Button(label=_AR_LETTERS[i], style=discord.ButtonStyle.primary, row=0, disabled=disable or i in self.removed)
+            b.callback = self._answer(i)
+            self.add_item(b)
+        f = discord.ui.Button(label="✂️ حذف إجابتين", style=discord.ButtonStyle.secondary, row=1, disabled=disable or self.fifty_used)
+        f.callback = self._fifty
+        w = discord.ui.Button(label=f"💰 انسحب ({fmt_money(million_walk_prize(self.answered))})" if self.answered else "💰 انسحب", style=discord.ButtonStyle.success, row=1,
+                              disabled=disable or self.answered == 0)
+        w.callback = self._walk
+        self.add_item(f)
+        self.add_item(w)
+
+    async def _show(self, picked=None, correct=None, banner=None, tone=None, final=False, content=None):
+        buf = await _run_sync(_render_million_sync, self.avatar, self.name, self.level, self.q, self.options, self.removed, picked, correct, banner, tone,
+                              million_safe_prize(self.answered))
+        try:
+            await self.message.edit(content=content, attachments=[discord.File(buf, filename="million.png")], view=None if final else self)
+        except Exception as e:
+            print(f"⚠️ المليون: تعذر تعديل الرسالة: {e}")
+
+    async def _end(self, kind, picked=None):
+        self.finished = True
+        if kind == "win":
+            prize, banner, tone = MILLION_LADDER[-1], f"مبروك! جاوبت على كل الأسئلة وربحت {fmt_money(MILLION_LADDER[-1])}", "win"
+        elif kind == "walk":
+            prize = million_walk_prize(self.answered)
+            banner, tone = f"انسحبت بـ {fmt_money(prize)}", "push"
+        elif kind == "timeout":
+            prize = million_safe_prize(self.answered)
+            banner, tone = (f"انتهى الوقت! خرجت بـ {fmt_money(prize)}" if prize else "انتهى الوقت! خرجت بدون جائزة"), "lose"
+        else:
+            prize = million_safe_prize(self.answered)
+            banner, tone = (f"إجابة خاطئة! خرجت بـ {fmt_money(prize)}" if prize else "إجابة خاطئة! خرجت بدون جائزة"), "lose"
+        if prize:
+            update_balance(self.user.id, prize)
+        bal = get_balance(self.user.id)
+        self.stop()
+        await self._show(picked, self.correct if kind in ("lose", "win") or picked is not None else None, banner, tone, final=True,
+                         content=f"🧠 {self.user.mention} • رصيدك: **{fmt_money(bal)}**")
+
+    async def _guard(self, interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("❌ هذي مو لعبتك!", ephemeral=True)
+            return False
+        await interaction.response.defer()
+        return True
+
+    def _answer(self, i):
+        async def cb(interaction):
+            if not await self._guard(interaction):
+                return
+            async with self.lock:
+                if self.finished or self.busy or i in self.removed:
+                    return
+                self.busy = True
+                try:
+                    if i == self.correct:
+                        self.answered += 1
+                        if self.answered >= 10:
+                            return await self._end("win", picked=i)
+                        self._build(disable=True)
+                        await self._show(i, self.correct, f"إجابة صحيحة! معك {fmt_money(million_walk_prize(self.answered))}", "win")
+                        await asyncio.sleep(1.8)
+                        self.level += 1
+                        self._load_question()
+                        self._build()
+                        await self._show(content=f"🧠 {self.user.mention} • السؤال {self.level} من 10")
+                    else:
+                        await self._end("lose", picked=i)
+                finally:
+                    self.busy = False
+        return cb
+
+    async def _fifty(self, interaction):
+        if not await self._guard(interaction):
+            return
+        async with self.lock:
+            if self.finished or self.fifty_used:
+                return
+            wrong = [i for i in range(4) if i != self.correct and i not in self.removed]
+            self.removed |= set(random.sample(wrong, min(2, len(wrong))))
+            self.fifty_used = True
+            self._build()
+            await self._show(content=f"🧠 {self.user.mention} • حذفت إجابتين")
+
+    async def _walk(self, interaction):
+        if not await self._guard(interaction):
+            return
+        async with self.lock:
+            if not self.finished and self.answered > 0:
+                await self._end("walk")
+
+    async def on_timeout(self):
+        async with self.lock:
+            if not self.finished:
+                await self._end("timeout")
+
+
+async def cmd_million(message):
+    user = message.author
+    set_cooldown(user.id, "مليون")
+    game = MillionGame(user, await _avatar_bytes(user))
+    buf = await _run_sync(_render_million_sync, game.avatar, game.name, 1, game.q, game.options, game.removed, None, None, None, None, 0)
+    game.message = await message.reply(content=f"🧠 {user.mention} • **من سيربح المليون** • 10 أسئلة، الأمان عند السؤال 3 و 6 (75 ثانية لكل سؤال)",
+                                       file=discord.File(buf, filename="million.png"), view=game, mention_author=False)
+
+
+# =====================================================================
+#               🤝  صفقات بين اللاعبين (ذهب / أسهم / ممتلكات)
+#   عرض ذهب 5 15000   |   عرض سياره 20000   |   عروض   |   الغاء عرض 12
+#   الغرض ينسحب منك عند العرض (ضمان)، والمشتري يدفع والبائع ياخذ المبلغ بعد رسوم 5٪
+# =====================================================================
+TRADE_LOCK = asyncio.Lock()
+TRADE_ITEM_WORDS = {"ذهب": "gold", "جولد": "gold", "gold": "gold", "سهم": "stocks", "اسهم": "stocks", "سياره": "car", "سيارات": "car",
+                    "بيت": "house", "بيوت": "house", "اراضي": "land", "ارض": "land", "متجر": "store", "محل": "store", "مبني": "building",
+                    "مباني": "building", "شركه": "company", "شركات": "company"}
+
+
+def trade_item_key(tok: str):
+    return TRADE_ITEM_WORDS.get(_norm_word(tok))
+
+
+def trade_owned(uid: int, item: str) -> int:
+    return get_gold(uid) if item == "gold" else get_properties(uid).get(item, 0)
+
+
+def trade_move(uid: int, item: str, n: int):
+    """n موجب = يضيف | n سالب = يسحب"""
+    if item == "gold":
+        update_gold(uid, n)
+    else:
+        update_property(uid, item, n)
+
+
+def trade_label(item: str, count: int) -> str:
+    return f"Gold x{count}" if item == "gold" else f"{TRADE_ITEM_LABEL[item]} × {count}"
+
+
+class TradeView(discord.ui.View):
+    def __init__(self, lid: int):
+        super().__init__(timeout=None)
+        self.lid = lid
+        buy = discord.ui.Button(label="🛒 اشتري", style=discord.ButtonStyle.success, custom_id=f"trade:buy:{lid}")
+        buy.callback = self._buy
+        cancel = discord.ui.Button(label="✖️ إلغاء العرض", style=discord.ButtonStyle.danger, custom_id=f"trade:cancel:{lid}")
+        cancel.callback = self._cancel
+        self.add_item(buy)
+        self.add_item(cancel)
+
+    async def _buy(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        ok, text, listing = await trade_buy(interaction.user, self.lid)
+        await interaction.followup.send(text, ephemeral=True)
+        if ok:
+            await trade_refresh_message(listing, "sold", getattr(interaction.user, "display_name", "مشتري"), interaction.message)
+
+    async def _cancel(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        ok, text, listing = await trade_cancel(interaction.user, self.lid)
+        await interaction.followup.send(text, ephemeral=True)
+        if ok:
+            await trade_refresh_message(listing, "cancel", None, interaction.message)
+
+
+async def trade_buy(buyer, lid: int):
+    async with TRADE_LOCK:
+        db = load_db()
+        l = db["listings"].get(str(lid))
+        if not l or l["state"] != "open":
+            return False, "❌ هذا العرض ما عاد متاح.", None
+        if buyer.id == l["seller"]:
+            return False, "❌ هذا عرضك أنت! تقدر تلغيه بزر الإلغاء.", None
+        if get_balance(buyer.id) < l["price"]:
+            return False, f"❌ رصيدك ما يكفي! السعر **{fmt_money(l['price'])}**.", None
+        update_balance(buyer.id, -l["price"])
+        update_balance(l["seller"], int(l["price"] * (1 - TRADE_TAX)))
+        trade_move(buyer.id, l["item"], l["count"])
+        db = load_db()
+        db["listings"][str(lid)].update({"state": "sold", "buyer": buyer.id})
+        save_db(db)
+        l = db["listings"][str(lid)]
+    return True, f"✅ اشتريت **{trade_label(l['item'], l['count'])}** بـ **{fmt_money(l['price'])}**. رصيدك: **{fmt_money(get_balance(buyer.id))}**", l
+
+
+async def trade_cancel(actor, lid: int):
+    async with TRADE_LOCK:
+        db = load_db()
+        l = db["listings"].get(str(lid))
+        if not l or l["state"] != "open":
+            return False, "❌ هذا العرض ما عاد متاح.", None
+        is_admin = _is_bank_admin(actor)
+        if actor.id != l["seller"] and not is_admin:
+            return False, "❌ بس صاحب العرض أو الإدارة يقدر يلغيه.", None
+        trade_move(l["seller"], l["item"], l["count"])
+        db = load_db()
+        db["listings"][str(lid)]["state"] = "cancel"
+        save_db(db)
+        l = db["listings"][str(lid)]
+    return True, "✅ تم إلغاء العرض ورجع الغرض لصاحبه.", l
+
+
+async def trade_refresh_message(listing, state, buyer_name, msg=None):
+    try:
+        if msg is None:
+            ch = bot.get_channel(listing["channel"]) or await bot.fetch_channel(listing["channel"])
+            msg = await ch.fetch_message(listing["message"])
+        buf = await _run_sync(_render_listing_sync, listing["id"], listing["item"], listing["count"], listing["price"],
+                              listing.get("seller_name", "؟"), None, TRADE_TAX, state, buyer_name)
+        await msg.edit(attachments=[discord.File(buf, filename="offer.png")], view=None)
+    except Exception as e:
+        print(f"⚠️ الصفقات: تعذر تحديث رسالة العرض: {e}")
+
+
+def restore_trade_views():
+    """يرجّع أزرار العروض المفتوحة بعد إعادة تشغيل البوت."""
+    for lid, l in load_db().get("listings", {}).items():
+        if l.get("state") == "open":
+            try:
+                bot.add_view(TradeView(int(lid)), message_id=l.get("message"))
+            except Exception:
+                pass
+
+
+async def cmd_trade_offer(message, rest):
+    user = message.author
+    if not rest:
+        return False
+    item = trade_item_key(rest[0])
+    if not item:
+        return False                     # مو أمر صفقة (كلمة عادية بالشات) - نتجاهلها بدون رد
+    nums = [parse_amount(t) for t in rest[1:]]
+    if len(nums) == 1 and nums[0]:
+        count, price = 1, nums[0]
+    elif len(nums) >= 2 and nums[0] and nums[1]:
+        count, price = nums[0], nums[1]
+    else:
+        await message.reply("❌ الاستخدام: `عرض ذهب 5 15000` (الكمية ثم السعر الكلي) أو `عرض سياره 20000`", mention_author=False)
+        return True
+    if count < 1 or price < 1 or price > 10 ** 12:
+        await message.reply("❌ الكمية والسعر لازم يكونون أرقام صحيحة أكبر من صفر.", mention_author=False)
+        return True
+    async with TRADE_LOCK:
+        db = load_db()
+        mine = sum(1 for l in db["listings"].values() if l["seller"] == user.id and l["state"] == "open")
+        if mine >= TRADE_MAX_OPEN:
+            await message.reply(f"❌ عندك {TRADE_MAX_OPEN} عروض مفتوحة، الغِ واحد أو انتظر يُباع.", mention_author=False)
+            return True
+        have = trade_owned(user.id, item)
+        if have < count:
+            await message.reply(f"❌ ما عندك كفاية! تملك **{have}** من {TRADE_ITEM_LABEL[item]}.", mention_author=False)
+            return True
+        trade_move(user.id, item, -count)                     # ضمان: الغرض ينسحب لين يُباع أو يُلغى
+        db = load_db()
+        db["listing_counter"] = db.get("listing_counter", 0) + 1
+        lid = db["listing_counter"]
+        l = {"id": lid, "seller": user.id, "seller_name": _clean_name(user.display_name), "item": item, "count": count, "price": price,
+             "channel": message.channel.id, "message": None, "state": "open", "created": _now_ts()}
+        db["listings"][str(lid)] = l
+        save_db(db)
+    buf = await _run_sync(_render_listing_sync, lid, item, count, price, l["seller_name"], await _avatar_bytes(user), TRADE_TAX)
+    sent = await message.reply(content=f"🤝 {user.mention} فتح عرض جديد! أول واحد يضغط **اشتري** ياخذه.", file=discord.File(buf, filename="offer.png"),
+                               view=TradeView(lid), mention_author=False)
+    async with TRADE_LOCK:
+        db = load_db()
+        db["listings"][str(lid)]["message"] = sent.id
+        save_db(db)
+    return True
+
+
+async def cmd_trade_list(message):
+    db = load_db()
+    open_l = [l for l in db["listings"].values() if l["state"] == "open"]
+    if not open_l:
+        return await message.reply("🤝 ما فيه عروض مفتوحة الحين. افتح عرض بـ `عرض ذهب 5 15000`", mention_author=False)
+    open_l.sort(key=lambda l: l["id"], reverse=True)
+    rows = [(f"#{l['id']}  {trade_label(l['item'], l['count'])}", fmt_money(l["price"]), _trunc(l.get("seller_name", "؟"), 12), None) for l in open_l[:12]]
+    buf = await _run_sync(_render_table_sync, "عروض اللاعبين", ["العرض", "السعر", "البائع"], rows, f"اضغط اشتري تحت العرض نفسه • رسوم البيع {int(TRADE_TAX * 100)}٪", "gold")
+    await _reply_file(message, f"🤝 {len(open_l)} عرض مفتوح", buf, "offers.png")
+
+
+async def cmd_trade_cancel(message, rest):
+    lid = parse_amount(" ".join(rest[1:])) if len(rest) > 1 else None
+    if not lid:
+        return await message.reply("❌ الاستخدام: `الغاء عرض 12`", mention_author=False)
+    ok, text, listing = await trade_cancel(message.author, lid)
+    await message.reply(text, mention_author=False)
+    if ok:
+        await trade_refresh_message(listing, "cancel", None)
+
+
+# =====================================================================
+#                    🏠  دخل الممتلكات (يتراكم بالساعة - أقصى 24 ساعة)
+# =====================================================================
+def income_rate(uid, db=None) -> int:
+    db = db or load_db()
+    props = db["properties"].get(str(uid), {})
+    return sum(props.get(k, 0) * r for k, r in INCOME_PER_HOUR.items())
+
+
+def income_claimable(uid, db=None):
+    db = db or load_db()
+    uid = str(uid)
+    rate = income_rate(uid, db)
+    last = db["income_last"].get(uid)
+    pending = db["income_pending"].get(uid, 0)
+    if last is None:
+        return rate, int(pending)
+    hours = max(0.0, (_now_ts() - last) / 3600)
+    return rate, int(min(pending + rate * hours, rate * INCOME_CAP_HOURS))
+
+
+def settle_income(uid) -> None:
+    """يثبّت الدخل المتراكم قبل أي تغيير بالممتلكات (عشان شراء ممتلكات جديدة ما يرفع دخل ساعات فاتت)."""
+    db = load_db()
+    key = str(uid)
+    _, claim = income_claimable(key, db)
+    db["income_pending"][key] = claim
+    db["income_last"][key] = _now_ts()
+    save_db(db)
+
+
+_update_property_raw = update_property
+
+
+def update_property(user_id: int, key: str, delta: int) -> int:
+    if delta != 0 and key in INCOME_PER_HOUR:
+        settle_income(user_id)
+    return _update_property_raw(user_id, key, delta)
+
+
+async def cmd_income(message):
+    user = message.author
+    db = load_db()
+    uid = str(user.id)
+    rate, claim = income_claimable(uid, db)
+    if rate <= 0:
+        return await message.reply("🏠 ما عندك ممتلكات تجيب دخل. اشتر (سياره / بيت / اراضي / متجر / مبنى / شركه) من أمر `شراء`.", mention_author=False)
+    if claim < 1:
+        f = await make_card(user, "دخل الممتلكات", f"دخلك {fmt_money(rate)} بالساعة - ارجع بعد شوي", amount="$0", side=f"رصيدك الحالي : {fmt_money(get_balance(user.id))}", icon="coins")
+        return await message.reply(content=f"🏠 {user.mention}", file=f, mention_author=False)
+    nb = update_balance(user.id, claim)
+    db = load_db()
+    db["income_pending"][uid] = 0
+    db["income_last"][uid] = _now_ts()
+    save_db(db)
+    cap_note = " (وصلت الحد الأقصى 24 ساعة)" if claim >= rate * INCOME_CAP_HOURS else ""
+    f = await make_card(user, "عملية ايداع", f"تحصيل دخل ممتلكاتك ({fmt_money(rate)} / ساعة){cap_note}", amount=_signed(claim), side=f"رصيدك الحالي : {fmt_money(nb)}", icon="coins")
+    await message.reply(content=f"🏠 {user.mention}", file=f, mention_author=False)
+
+
+# =====================================================================
+#                              🏦  قروض البنك
+#   قرض 5000 | سداد | سداد 2000 | قرضي  - فائدة 10٪ - مهلة 24 ساعة - السقف حسب ثروتك
+#   لو انتهت المهلة يُخصم المطلوب من رصيدك تلقائياً عند أول أمر بنك، والباقي ينزاد عليه 10٪ غرامة تأخير
+# =====================================================================
+def loan_limit(uid) -> int:
+    return max(LOAN_MIN, min(LOAN_MAX, int(net_worth(uid) * LOAN_WORTH_RATIO)))
+
+
+def get_loan(uid):
+    return load_db()["loans"].get(str(uid))
+
+
+def settle_overdue_loan(uid):
+    """لو قرض اللاعب متأخر: يخصم من رصيده. يرجع نص إشعار أو None."""
+    db = load_db()
+    key = str(uid)
+    loan = db["loans"].get(key)
+    if not loan or _now_ts() < loan["due"]:
+        return None
+    bal = db["economy"].get(key, STARTING_BALANCE)
+    take = min(bal, loan["owed"])
+    db["economy"][key] = bal - take
+    loan["owed"] -= take
+    if loan["owed"] <= 0:
+        del db["loans"][key]
+        save_db(db)
+        return f"🏦 انتهت مهلة قرضك وتم خصم **{fmt_money(take)}** من رصيدك وسُدد القرض بالكامل."
+    if not loan.get("penalized"):
+        loan["owed"] = int(loan["owed"] * (1 + LOAN_LATE_PENALTY))
+        loan["penalized"] = True
+    loan["due"] = _now_ts() + LOAN_HOURS * 3600
+    save_db(db)
+    return (f"🏦 انتهت مهلة قرضك! خُصم **{fmt_money(take)}** وباقي عليك **{fmt_money(loan['owed'])}** (مع غرامة تأخير {int(LOAN_LATE_PENALTY * 100)}٪). "
+            f"اكتب `سداد` قبل ما يُخصم من جديد.")
+
+
+async def cmd_loan(message, rest):
+    user = message.author
+    uid = str(user.id)
+    loan = get_loan(uid)
+    amount = parse_amount_ctx(rest, user.id) if rest else None
+    limit = loan_limit(uid)
+    if rest and rest[0] in ("كامل", "الكل", "كل", "اقصى", "أقصى", "max"):
+        amount = limit
+    if amount is None:
+        if loan:
+            return await cmd_loan_status(message)
+        f = await make_card(user, "قروض البنك", f"سقف قرضك {fmt_money(limit)} • فائدة {int(LOAN_INTEREST * 100)}٪ • مهلة {LOAN_HOURS} ساعة",
+                            amount=fmt_money(limit), side="اكتب: قرض 5000", icon="coins")
+        return await message.reply(content=f"🏦 {user.mention}", file=f, mention_author=False)
+    if loan:
+        return await message.reply(f"❌ عندك قرض قائم باقي عليه **{fmt_money(loan['owed'])}**. سدّده بـ `سداد` أول.", mention_author=False)
+    if amount < LOAN_MIN:
+        return await message.reply(f"❌ أقل قرض **{fmt_money(LOAN_MIN)}**.", mention_author=False)
+    if amount > limit:
+        return await message.reply(f"❌ سقف قرضك الحين **{fmt_money(limit)}** (يرتفع مع ثروتك وممتلكاتك).", mention_author=False)
+    owed = int(amount * (1 + LOAN_INTEREST))
+    db = load_db()
+    db["loans"][uid] = {"principal": amount, "owed": owed, "due": _now_ts() + LOAN_HOURS * 3600, "penalized": False}
+    save_db(db)
+    nb = update_balance(user.id, amount)
+    f = await make_card(user, "عملية ايداع", f"تم صرف قرض • عليك {fmt_money(owed)} خلال {LOAN_HOURS} ساعة", amount=_signed(amount),
+                        side=f"رصيدك الحالي : {fmt_money(nb)}", icon="coins")
+    await message.reply(content=f"🏦 {user.mention}", file=f, mention_author=False)
+
+
+async def cmd_loan_status(message):
+    user = message.author
+    loan = get_loan(user.id)
+    if not loan:
+        return await message.reply(f"🏦 ما عليك أي قرض. سقفك الحين **{fmt_money(loan_limit(user.id))}** - اكتب `قرض 5000`.", mention_author=False)
+    left = loan["due"] - _now_ts()
+    f = await make_card(user, "قرضك الحالي", f"المتبقي عليك {fmt_money(loan['owed'])} • باقي على الموعد {format_clock(max(0, left))}", amount=fmt_money(loan["owed"]),
+                        side="اكتب: سداد  (أو سداد 2000)", icon="chart_down")
+    await message.reply(content=f"🏦 {user.mention}", file=f, mention_author=False)
+
+
+async def cmd_repay(message, rest):
+    user = message.author
+    loan = get_loan(user.id)
+    if not loan:
+        return await message.reply("🏦 ما عليك أي قرض.", mention_author=False)
+    bal = get_balance(user.id)
+    if bal <= 0:
+        return await message.reply("❌ رصيدك صفر، ما تقدر تسدد الحين.", mention_author=False)
+    if not rest or rest[0] in ("كامل", "الكل", "كل"):
+        pay = min(loan["owed"], bal)
+    else:
+        want = parse_amount_ctx(rest, user.id)
+        if not want or want < 1:
+            return await message.reply("❌ الاستخدام: `سداد` أو `سداد 2000` أو `سداد نص`", mention_author=False)
+        pay = min(want, loan["owed"], bal)
+    nb = update_balance(user.id, -pay)
+    db = load_db()
+    ln = db["loans"].get(str(user.id))
+    ln["owed"] -= pay
+    cleared = ln["owed"] <= 0
+    if cleared:
+        del db["loans"][str(user.id)]
+    save_db(db)
+    main = "تم سداد قرضك بالكامل 🎉" if cleared else f"سددت جزء من قرضك • باقي {fmt_money(ln['owed'])}"
+    f = await make_card(user, "عملية خصم", main, amount=_signed(-pay), side=f"رصيدك الحالي : {fmt_money(nb)}", icon="coins")
+    await message.reply(content=f"🏦 {user.mention}", file=f, mention_author=False)
+
+
+# =====================================================================
+#                          🔀  موزّع الأوامر الجديدة
+# =====================================================================
+NEW_ECON_WORDS = {"بلاكجاك", "بلاك", "كراش", "مليون", "عرض", "عروض", "الغاء", "دخل", "قرض", "قرضي", "سداد"}
+
+
+async def handle_new_economy(message, parts) -> bool:
+    word = parts[0]
+    rest = [p for p in parts[1:] if not re.fullmatch(r"<@!?\d+>", p)]
+    user = message.author
+    if word == "بلاك":
+        if not rest or rest[0] != "جاك":
+            return False
+        word, rest = "بلاكجاك", rest[1:]
+    if word == "الغاء":
+        if not rest or rest[0] not in ("عرض", "العرض"):
+            return False
+        await cmd_trade_cancel(message, rest)
+        return True
+    try:
+        if word in ("بلاكجاك", "كراش"):
+            notice = cooldown_notice(user.id, word) if rest else None
+            if notice:
+                await message.reply(notice, mention_author=False)
+                return True
+            if word == "بلاكجاك":
+                await cmd_blackjack(message, parse_amount_ctx(rest[:1], user.id) if rest else None)
+            else:
+                await cmd_crash(message, rest)
+        elif word == "مليون":
+            if rest:
+                return False
+            notice = cooldown_notice(user.id, "مليون")
+            if notice:
+                await message.reply(notice, mention_author=False)
+                return True
+            await cmd_million(message)
+        elif word == "عرض":
+            return await cmd_trade_offer(message, rest)
+        elif word == "عروض":
+            if rest:
+                return False
+            await cmd_trade_list(message)
+        elif word == "دخل":
+            if rest:
+                return False
+            await cmd_income(message)
+        elif word == "قرض":
+            await cmd_loan(message, rest)
+        elif word == "قرضي":
+            await cmd_loan_status(message)
+        elif word == "سداد":
+            await cmd_repay(message, rest)
+        else:
+            return False
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await message.reply(f"⚠️ صار خطأ بالبنك: {e}", mention_author=False)
+    return True
+
+
+# =====================================================================
 #                     🧩  الأوامر الأساسية (Slash Commands)
 # =====================================================================
 
@@ -6919,7 +8278,7 @@ async def send_ticket_panel_message(channel: discord.TextChannel):
         description=(
             get_custom_message("ticket_panel", "description") + "\n\n"
             "**الأنواع المتاحة:**\n"
-            + "\n".join(f"{v['emoji']} {v['label']}" for v in TICKET_TYPES.values())
+            + "\n".join(f"{v['emoji']} {v['label']}" for v in TICKET_TYPES.values() if not v.get("hidden"))
         ),
         color=MAIN_COLOR,
     )
