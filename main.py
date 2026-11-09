@@ -3355,7 +3355,7 @@ async def handle_bank_text(message: discord.Message) -> bool:
     if not isinstance(message.author, discord.Member):
         return False
     parts = message.content.strip().split()
-    if parts and parts[0] in (NEW_ECON_WORDS | BANK_ADMIN_WORDS | set(EXTRA_BANK_ACTIONS) | set(BANK_TEXT_TRIGGERS)):
+    if parts and parts[0] in (NEW_ECON_WORDS | set(BANK_ADMIN_WORDS) | set(EXTRA_BANK_ACTIONS) | set(BANK_TEXT_TRIGGERS)):
         try:
             _ov = settle_overdue_loan(message.author.id)
             if _ov:
